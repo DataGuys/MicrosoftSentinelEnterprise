@@ -396,27 +396,303 @@ function Analyze-DataDistribution {
 }
 
 # Generate optimization report
-function Generate-Report {
-    param (
-        [array]$QueryRecommendations,
-        [array]$CrossWorkspaceRecommendations,
-        [array]$DataDistributionRecommendations
-    )
-    
-    $totalPotentialSavings = 0
-    
-    # Calculate total potential savings
-    foreach ($rec in $QueryRecommendations) {
-        if ($rec.PotentialSavings -is [double]) {
-            $totalPotentialSavings += $rec.PotentialSavings
+    function Generate-Report {
+        param (
+            [array]$QueryRecommendations,
+            [array]$CrossWorkspaceRecommendations,
+            [array]$DataDistributionRecommendations
+        )
+        
+        $totalPotentialSavings = 0
+        
+        # Calculate total potential savings
+        foreach ($rec in $QueryRecommendations) {
+            if ($rec.PotentialSavings -is [double]) {
+                $totalPotentialSavings += $rec.PotentialSavings
+            }
+        }
+        
+        foreach ($rec in $CrossWorkspaceRecommendations) {
+            if ($rec.PotentialSavings -is [double]) {
+                $totalPotentialSavings += $rec.PotentialSavings
+            }
+        }
+        
+        foreach ($rec in $DataDistributionRecommendations) {
+            if ($rec.PotentialSavings -is [double]) {
+                $totalPotentialSavings += $rec.PotentialSavings
+            }
+        }
+        
+        # Create HTML report
+        $reportDate = Get-Date -Format "yyyy-MM-dd"
+        $reportFile = Join-Path -Path $OutputPath -ChildPath "SentinelOptimizationReport-$reportDate.html"
+        
+        $htmlReport = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Azure Sentinel Query Optimization Report</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            color: #333;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+        }
+        h1, h2, h3 {
+            color: #0078d4;
+        }
+        .section {
+            margin-bottom: 30px;
+            padding: 20px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            background-color: #f9f9f9;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 15px;
+        }
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }
+        th {
+            background-color: #0078d4;
+            color: white;
+        }
+        tr:nth-child(even) {
+            background-color: #f2f2f2;
+        }
+        .savings {
+            font-weight: bold;
+            color: #107c10;
+            font-size: 18px;
+            margin: 20px 0;
+        }
+        .footer {
+            margin-top: 30px;
+            font-size: 12px;
+            color: #666;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Azure Sentinel Query Optimization Report</h1>
+        <p>Generated on: $reportDate</p>
+        <p>Analysis period: Last $DaysToAnalyze days</p>
+        
+        <div class="savings">
+            Potential monthly savings: $$$totalPotentialSavings
+        </div>
+        
+        <div class="section">
+            <h2>Scheduled Query Optimization</h2>
+"@
+
+        if ($QueryRecommendations.Count -gt 0) {
+            $htmlReport += @"
+            <table>
+                <thead>
+                    <tr>
+                        <th>Query ID</th>
+                        <th>Type</th>
+                        <th>Recommendation</th>
+                        <th>Potential Savings</th>
+                    </tr>
+                </thead>
+                <tbody>
+"@
+            
+            foreach ($rec in $QueryRecommendations) {
+                $htmlReport += @"
+                    <tr>
+                        <td>$($rec.QueryId)</td>
+                        <td>$($rec.Type)</td>
+                        <td>$($rec.Recommendation)</td>
+                        <td>$$$($rec.PotentialSavings)</td>
+                    </tr>
+"@
+            }
+            
+            $htmlReport += @"
+                </tbody>
+            </table>
+"@
+        } else {
+            $htmlReport += @"
+            <p>No query optimization recommendations found.</p>
+"@
+        }
+        
+        $htmlReport += @"
+        </div>
+        
+        <div class="section">
+            <h2>Cross-Workspace Query Optimization</h2>
+"@
+
+        if ($CrossWorkspaceRecommendations.Count -gt 0) {
+            $htmlReport += @"
+            <table>
+                <thead>
+                    <tr>
+                        <th>Type</th>
+                        <th>Recommendation</th>
+                        <th>Potential Savings</th>
+                    </tr>
+                </thead>
+                <tbody>
+"@
+            
+            foreach ($rec in $CrossWorkspaceRecommendations) {
+                $htmlReport += @"
+                    <tr>
+                        <td>$($rec.Type)</td>
+                        <td>$($rec.Recommendation)</td>
+                        <td>$($rec.PotentialSavings)</td>
+                    </tr>
+"@
+            }
+            
+            $htmlReport += @"
+                </tbody>
+            </table>
+"@
+        } else {
+            $htmlReport += @"
+            <p>No cross-workspace query optimization recommendations found.</p>
+"@
+        }
+        
+        $htmlReport += @"
+        </div>
+        
+        <div class="section">
+            <h2>Data Distribution Optimization</h2>
+"@
+
+        if ($DataDistributionRecommendations.Count -gt 0) {
+            $htmlReport += @"
+            <table>
+                <thead>
+                    <tr>
+                        <th>Type</th>
+                        <th>Description</th>
+                        <th>Affected Tables</th>
+                        <th>Recommendation</th>
+                        <th>Potential Savings</th>
+                    </tr>
+                </thead>
+                <tbody>
+"@
+            
+            foreach ($rec in $DataDistributionRecommendations) {
+                $htmlReport += @"
+                    <tr>
+                        <td>$($rec.Type)</td>
+                        <td>$($rec.Description)</td>
+                        <td>$($rec.AffectedTables)</td>
+                        <td>$($rec.Recommendation)</td>
+                        <td>$$$($rec.PotentialSavings)</td>
+                    </tr>
+"@
+            }
+            
+            $htmlReport += @"
+                </tbody>
+            </table>
+"@
+        } else {
+            $htmlReport += @"
+            <p>No data distribution optimization recommendations found.</p>
+"@
+        }
+        
+        $htmlReport += @"
+        </div>
+        
+        <div class="section">
+            <h2>Implementation Steps</h2>
+            <h3>For Query Optimization:</h3>
+            <ol>
+                <li>Review high-cost scheduled queries and adjust time ranges or filtering</li>
+                <li>Consider reducing the frequency of non-critical scheduled queries</li>
+                <li>Use the "project" operator to select only necessary columns</li>
+                <li>Add early filtering in queries to reduce data processed</li>
+            </ol>
+            
+            <h3>For Cross-Workspace Query Optimization:</h3>
+            <ol>
+                <li>Consider materializing frequently used cross-workspace data</li>
+                <li>Create scheduled analytics rules to copy key data between workspaces</li>
+                <li>Apply strict time filtering on cross-workspace queries</li>
+                <li>Avoid multiple cross-workspace joins in a single query</li>
+            </ol>
+            
+            <h3>For Data Distribution Optimization:</h3>
+            <ol>
+                <li>Review DCR transformations to prevent data duplication</li>
+                <li>Move non-critical high-volume data to Basic tier workspaces</li>
+                <li>Implement more aggressive filtering for Analytics tier data</li>
+                <li>Consider implementing a Log Analytics Cluster for high-volume environments</li>
+            </ol>
+        </div>
+        
+        <div class="footer">
+            Generated by Azure Sentinel Query Optimization Tool
+        </div>
+    </div>
+</body>
+</html>
+"@
+        
+        # Save report to file
+        Set-Content -Path $reportFile -Value $htmlReport
+        
+        return $reportFile
+    }
+
+    # Main execution
+    CheckPrerequisites
+    ValidateWorkspaces
+
+    Write-Host "Starting Azure Sentinel query optimization analysis..." -ForegroundColor Cyan
+    Write-Host "Analyzing data for the past $DaysToAnalyze days..." -ForegroundColor Cyan
+
+    # Run analysis
+    $queryRecommendations = Analyze-ScheduledQueries
+    $crossWorkspaceRecommendations = Analyze-CrossWorkspaceQueries
+    $dataDistributionRecommendations = Analyze-DataDistribution
+
+    # Generate report
+    $reportFile = Generate-Report -QueryRecommendations $queryRecommendations -CrossWorkspaceRecommendations $crossWorkspaceRecommendations -DataDistributionRecommendations $dataDistributionRecommendations
+
+    Write-Host "Analysis complete!" -ForegroundColor Green
+    Write-Host "Report saved to: $reportFile" -ForegroundColor Green
+    Write-Host "Open the report to view detailed optimization recommendations."
+
+    # If PowerShell is running on Windows, try to open the report
+    if ($IsWindows -or (-not $IsLinux -and -not $IsMacOS)) {
+        try {
+            Invoke-Item $reportFile
+        } catch {
+            Write-Warning "Could not automatically open the report. Please open it manually."
         }
     }
-    
-    foreach ($rec in $CrossWorkspaceRecommendations) {
-        if ($rec.PotentialSavings -is [double]) {
-            $totalPotentialSavings += $rec.PotentialSavings
-        }
-    }
-    
-    foreach ($rec in $DataDistributionRecommendations) {
-        if ($rec.Potential
