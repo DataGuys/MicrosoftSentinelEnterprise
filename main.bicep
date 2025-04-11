@@ -5,6 +5,7 @@
 // - Staging workspace for preprocessing
 // - Data Collection Rules (DCRs) with transformations
 // - Microsoft Defender XDR integration
+// - Option for Log Analytics Cluster for high-volume environments
 
 // Parameters
 @description('The location for all resources')
@@ -18,16 +19,17 @@ param tags object = {
   environment: 'production'
   managedBy: 'security-team'
   workload: 'security-monitoring'
+  complianceFrameworks: 'SOX,GDPR,CCPA'
 }
 
-@description('Default retention days for Log Analytics Workspaces')
-param defaultRetentionDays int = 90
+@description('Default retention days for Log Analytics Workspaces - SOX requires 7 years (2557 days)')
+param defaultRetentionDays int = 2557
 
-@description('Retention days for verbose/archive workspace')
-param verboseRetentionDays int = 365
+@description('Archive retention days for verbose/archive workspace - SOX requires 7 years (2557 days)')
+param verboseRetentionDays int = 2557
 
 @description('Retention days for staging workspace')
-param stagingRetentionDays int = 30
+param stagingRetentionDays int = 90
 
 @description('Pricing tier for the central Sentinel workspace')
 @allowed([
@@ -66,11 +68,49 @@ param stagingDailyCap int = 0 // 0 means no cap
 @description('Array of VM resource IDs to assign the DCRs to')
 param vmResourceIds array = []
 
+@description('Flag to deploy a Log Analytics Cluster instead of regular workspaces')
+param useLogAnalyticsCluster bool = false
+
+@description('Capacity reservation in GB per day for the Log Analytics Cluster')
+param laClusterCapacityReservationGB int = 1000
+
+@description('Enable Customer-Managed Keys for encryption')
+param enableCustomerManagedKey bool = false
+
+@description('Key Vault ID containing the encryption key (required if enableCustomerManagedKey is true)')
+param keyVaultId string = ''
+
+@description('Key name in the Key Vault (required if enableCustomerManagedKey is true)')
+param keyName string = ''
+
+@description('Key version in the Key Vault (required if enableCustomerManagedKey is true)')
+param keyVersion string = ''
+
 // Variables
 var sentinelWorkspaceName = '${prefix}-sentinel-ws'
 var verboseWorkspaceName = '${prefix}-verbose-ws'
 var stagingWorkspaceName = '${prefix}-staging-ws'
 var wdxrConnectorName = 'MicrosoftThreatProtection'
+
+// --------------------- LOG ANALYTICS CLUSTER (OPTIONAL) -----------------------
+
+// Log Analytics Cluster for high-volume environments (optional)
+resource laCluster 'Microsoft.OperationalInsights/clusters@2021-06-01' = if (useLogAnalyticsCluster) {
+  name: '${prefix}-la-cluster'
+  location: location
+  tags: tags
+  properties: {
+    sku: {
+      name: 'CapacityReservation'
+      capacity: laClusterCapacityReservationGB
+    }
+    keyVaultProperties: enableCustomerManagedKey ? {
+      keyVaultUri: keyVaultId
+      keyName: keyName
+      keyVersion: keyVersion
+    } : null
+  }
+}
 
 // --------------------- WORKSPACES -----------------------
 
@@ -81,7 +121,7 @@ resource sentinelWorkspace 'Microsoft.OperationalInsights/workspaces@2022-10-01'
   tags: tags
   properties: {
     sku: {
-      name: sentinelWorkspaceSku
+      name: useLogAnalyticsCluster ? 'LACluster' : sentinelWorkspaceSku
     }
     retentionInDays: defaultRetentionDays
     workspaceCapping: {
@@ -89,7 +129,9 @@ resource sentinelWorkspace 'Microsoft.OperationalInsights/workspaces@2022-10-01'
     }
     features: {
       enableLogAccessUsingOnlyResourcePermissions: true
+      immediatePurgeDataOn30Days: false // Disabled for SOX compliance
     }
+    clusterResourceId: useLogAnalyticsCluster ? laCluster.id : null
   }
 }
 
@@ -100,7 +142,7 @@ resource verboseWorkspace 'Microsoft.OperationalInsights/workspaces@2022-10-01' 
   tags: tags
   properties: {
     sku: {
-      name: verboseWorkspaceSku
+      name: useLogAnalyticsCluster ? 'LACluster' : verboseWorkspaceSku
     }
     retentionInDays: verboseRetentionDays
     workspaceCapping: {
@@ -108,7 +150,9 @@ resource verboseWorkspace 'Microsoft.OperationalInsights/workspaces@2022-10-01' 
     }
     features: {
       enableLogAccessUsingOnlyResourcePermissions: true
+      immediatePurgeDataOn30Days: false // Disabled for SOX compliance
     }
+    clusterResourceId: useLogAnalyticsCluster ? laCluster.id : null
   }
 }
 
@@ -119,7 +163,7 @@ resource stagingWorkspace 'Microsoft.OperationalInsights/workspaces@2022-10-01' 
   tags: tags
   properties: {
     sku: {
-      name: sentinelWorkspaceSku // Using same SKU as Sentinel for query performance
+      name: useLogAnalyticsCluster ? 'LACluster' : sentinelWorkspaceSku
     }
     retentionInDays: stagingRetentionDays
     workspaceCapping: {
@@ -127,7 +171,9 @@ resource stagingWorkspace 'Microsoft.OperationalInsights/workspaces@2022-10-01' 
     }
     features: {
       enableLogAccessUsingOnlyResourcePermissions: true
+      immediatePurgeDataOn30Days: false // For compliance
     }
+    clusterResourceId: useLogAnalyticsCluster ? laCluster.id : null
   }
 }
 
@@ -684,6 +730,68 @@ resource azureFirewallVerboseDiagnosticSettings 'Microsoft.Insights/diagnosticSe
   }
 }
 
+// --------------------- DATA EXPORT FOR REGULATORY COMPLIANCE -----------------------
+
+// Data Export for long-term storage in Azure Data Lake (for GDPR/CCPA/SOX compliance)
+resource sentinelDataExport 'Microsoft.OperationalInsights/workspaces/dataExports@2020-08-01' = {
+  name: '${sentinelWorkspaceName}/compliance-data-export'
+  properties: {
+    destination: {
+      resourceId: storageAccount.id
+    }
+    tableName: 'SecurityEvent'
+    enabled: true
+  }
+  dependsOn: [
+    sentinelWorkspace
+  ]
+}
+
+// Storage account for data export (archival)
+resource storageAccount 'Microsoft.Storage/storageAccounts@2021-08-01' = {
+  name: '${prefix}compliancesa'
+  location: location
+  tags: tags
+  kind: 'StorageV2'
+  sku: {
+    name: 'Standard_GRS' // Geo-redundant storage for regulatory compliance
+  }
+  properties: {
+    accessTier: 'Cool'
+    supportsHttpsTrafficOnly: true
+    minimumTlsVersion: 'TLS1_2'
+    allowBlobPublicAccess: false
+    allowSharedKeyAccess: true
+    networkAcls: {
+      bypass: 'AzureServices'
+      defaultAction: 'Deny'
+      virtualNetworkRules: []
+      ipRules: []
+    }
+    encryption: {
+      services: {
+        blob: {
+          enabled: true
+        }
+        file: {
+          enabled: true
+        }
+      }
+      keySource: 'Microsoft.Storage'
+    }
+  }
+}
+
+// Add GDPR/CCPA compliance lock to prevent accidental deletion
+resource deleteLock 'Microsoft.Authorization/locks@2020-05-01' = {
+  name: '${prefix}-compliance-delete-lock'
+  properties: {
+    level: 'CanNotDelete'
+    notes: 'This lock prevents deletion of resources required for regulatory compliance (SOX, GDPR, CCPA)'
+  }
+  scope: storageAccount
+}
+
 // --------------------- OUTPUTS -----------------------
 
 output sentinelWorkspaceId string = sentinelWorkspace.id
@@ -692,3 +800,5 @@ output stagingWorkspaceId string = stagingWorkspace.id
 output sentinelWorkspaceName string = sentinelWorkspace.name
 output verboseWorkspaceName string = verboseWorkspace.name
 output stagingWorkspaceName string = stagingWorkspace.name
+output laClusterId string = useLogAnalyticsCluster ? laCluster.id : 'Not deployed'
+output storageAccountId string = storageAccount.id
