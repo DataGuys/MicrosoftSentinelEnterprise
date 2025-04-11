@@ -1,13 +1,7 @@
-// Multi-Workspace Azure Sentinel Architecture - Bicep Template
-// This template deploys a tiered Azure Sentinel logging architecture with:
-// - Central Sentinel workspace (Analytics tier)
-// - Verbose logs workspace (Auxiliary/Basic tier)
-// - Staging workspace for preprocessing
-// - Data Collection Rules (DCRs) with transformations
-// - Microsoft Defender XDR integration
-// - Option for Log Analytics Cluster for high-volume environments
+// Multi-Workspace Azure Sentinel Architecture - Main Orchestrator
+// This template orchestrates the deployment of the modular Sentinel architecture
 
-// Parameters
+// Common Parameters
 @description('The location for all resources')
 param location string = resourceGroup().location
 
@@ -22,6 +16,7 @@ param tags object = {
   complianceFrameworks: 'SOX,GDPR,CCPA'
 }
 
+// Workspace Parameters
 @description('Default retention days for Log Analytics Workspaces - SOX requires 7 years (2557 days)')
 param defaultRetentionDays int = 2557
 
@@ -65,9 +60,7 @@ param verboseDailyCap int = 0 // 0 means no cap
 @description('Daily cap for the staging workspace in GB')
 param stagingDailyCap int = 0 // 0 means no cap
 
-@description('Array of VM resource IDs to assign the DCRs to')
-param vmResourceIds array = []
-
+// Log Analytics Cluster Parameters
 @description('Flag to deploy a Log Analytics Cluster instead of regular workspaces')
 param useLogAnalyticsCluster bool = false
 
@@ -86,719 +79,97 @@ param keyName string = ''
 @description('Key version in the Key Vault (required if enableCustomerManagedKey is true)')
 param keyVersion string = ''
 
-// Variables
-var sentinelWorkspaceName = '${prefix}-sentinel-ws'
-var verboseWorkspaceName = '${prefix}-verbose-ws'
-var stagingWorkspaceName = '${prefix}-staging-ws'
-var wdxrConnectorName = 'MicrosoftThreatProtection'
+// VM Resource Parameters
+@description('Array of VM resource IDs to assign the DCRs to')
+param vmResourceIds array = []
 
-// --------------------- LOG ANALYTICS CLUSTER (OPTIONAL) -----------------------
-
-// Log Analytics Cluster for high-volume environments (optional)
-resource laCluster 'Microsoft.OperationalInsights/clusters@2021-06-01' = if (useLogAnalyticsCluster) {
-  name: '${prefix}-la-cluster'
-  location: location
-  tags: tags
-  properties: {
-    sku: {
-      name: 'CapacityReservation'
-      capacity: laClusterCapacityReservationGB
-    }
-    keyVaultProperties: enableCustomerManagedKey ? {
-      keyVaultUri: keyVaultId
-      keyName: keyName
-      keyVersion: keyVersion
-    } : null
+// Deploy Workspaces and Log Analytics Cluster
+module workspaces 'modules/workspaces.bicep' = {
+  name: 'workspaces-deployment'
+  params: {
+    location: location
+    prefix: prefix
+    tags: tags
+    defaultRetentionDays: defaultRetentionDays
+    verboseRetentionDays: verboseRetentionDays
+    stagingRetentionDays: stagingRetentionDays
+    sentinelWorkspaceSku: sentinelWorkspaceSku
+    verboseWorkspaceSku: verboseWorkspaceSku
+    sentinelDailyCap: sentinelDailyCap
+    verboseDailyCap: verboseDailyCap
+    stagingDailyCap: stagingDailyCap
+    useLogAnalyticsCluster: useLogAnalyticsCluster
+    laClusterCapacityReservationGB: laClusterCapacityReservationGB
+    enableCustomerManagedKey: enableCustomerManagedKey
+    keyVaultId: keyVaultId
+    keyName: keyName
+    keyVersion: keyVersion
   }
 }
 
-// --------------------- WORKSPACES -----------------------
-
-// 1. Central Sentinel Workspace (Analytics Tier)
-resource sentinelWorkspace 'Microsoft.OperationalInsights/workspaces@2022-10-01' = {
-  name: sentinelWorkspaceName
-  location: location
-  tags: tags
-  properties: {
-    sku: {
-      name: useLogAnalyticsCluster ? 'LACluster' : sentinelWorkspaceSku
-    }
-    retentionInDays: defaultRetentionDays
-    workspaceCapping: {
-      dailyQuotaGb: sentinelDailyCap
-    }
-    features: {
-      enableLogAccessUsingOnlyResourcePermissions: true
-      immediatePurgeDataOn30Days: false // Disabled for SOX compliance
-    }
-    clusterResourceId: useLogAnalyticsCluster ? laCluster.id : null
-  }
-}
-
-// 2. Verbose Logs Workspace (Auxiliary Tier) for cost optimization
-resource verboseWorkspace 'Microsoft.OperationalInsights/workspaces@2022-10-01' = {
-  name: verboseWorkspaceName
-  location: location
-  tags: tags
-  properties: {
-    sku: {
-      name: useLogAnalyticsCluster ? 'LACluster' : verboseWorkspaceSku
-    }
-    retentionInDays: verboseRetentionDays
-    workspaceCapping: {
-      dailyQuotaGb: verboseDailyCap
-    }
-    features: {
-      enableLogAccessUsingOnlyResourcePermissions: true
-      immediatePurgeDataOn30Days: false // Disabled for SOX compliance
-    }
-    clusterResourceId: useLogAnalyticsCluster ? laCluster.id : null
-  }
-}
-
-// 3. Staging Workspace for pre-processing
-resource stagingWorkspace 'Microsoft.OperationalInsights/workspaces@2022-10-01' = {
-  name: stagingWorkspaceName
-  location: location
-  tags: tags
-  properties: {
-    sku: {
-      name: useLogAnalyticsCluster ? 'LACluster' : sentinelWorkspaceSku
-    }
-    retentionInDays: stagingRetentionDays
-    workspaceCapping: {
-      dailyQuotaGb: stagingDailyCap
-    }
-    features: {
-      enableLogAccessUsingOnlyResourcePermissions: true
-      immediatePurgeDataOn30Days: false // For compliance
-    }
-    clusterResourceId: useLogAnalyticsCluster ? laCluster.id : null
-  }
-}
-
-// Enable Microsoft Sentinel on the central workspace
-resource enableSentinel 'Microsoft.SecurityInsights/onboardingStates@2023-05-01' = {
-  scope: sentinelWorkspace
-  name: 'default'
-  properties: {}
-}
-
-// --------------------- DATA COLLECTION RULES -----------------------
-
-// 1. DCR for Windows Security Events - Critical Events to Sentinel
-resource dcrSecurityEventsCritical 'Microsoft.Insights/dataCollectionRules@2022-06-01' = {
-  name: '${prefix}-dcr-win-security-critical'
-  location: location
-  tags: tags
-  properties: {
-    dataCollectionEndpointId: null // Use default endpoint
-    description: 'Collects critical Windows Security Events for Sentinel'
-    dataSources: {
-      windowsEventLogs: [
-        {
-          name: 'winSecurityEvents'
-          streams: ['Microsoft-SecurityEvent']
-          xPathQueries: ['Security!*[System[(EventID=4624 or EventID=4625 or EventID=4672 or EventID=4720 or EventID=4726 or EventID=4740 or EventID=1102 or EventID=4698 or EventID=4697 or EventID=7045)]]']
-        }
-      ]
-    }
-    destinations: {
-      logAnalytics: [
-        {
-          workspaceResourceId: sentinelWorkspace.id
-          name: 'sentinelDestination'
-        }
-      ]
-    }
-    dataFlows: [
-      {
-        streams: ['Microsoft-SecurityEvent']
-        destinations: ['sentinelDestination']
-        transformKql: 'source | where EventID in (4624, 4625, 4672, 4720, 4726, 4740, 1102, 4698, 4697, 7045)'
-      }
-    ]
-  }
-}
-
-// 2. DCR for Windows Security Events - All Events to Verbose Workspace
-resource dcrSecurityEventsAll 'Microsoft.Insights/dataCollectionRules@2022-06-01' = {
-  name: '${prefix}-dcr-win-security-all'
-  location: location
-  tags: tags
-  properties: {
-    dataCollectionEndpointId: null // Use default endpoint
-    description: 'Collects all Windows Security Events for verbose logging'
-    dataSources: {
-      windowsEventLogs: [
-        {
-          name: 'winSecurityEventsAll'
-          streams: ['Microsoft-SecurityEvent']
-          xPathQueries: ['Security!*']
-        }
-      ]
-    }
-    destinations: {
-      logAnalytics: [
-        {
-          workspaceResourceId: verboseWorkspace.id
-          name: 'verboseDestination'
-        }
-      ]
-    }
-    dataFlows: [
-      {
-        streams: ['Microsoft-SecurityEvent']
-        destinations: ['verboseDestination']
-        // No transform here - we want all events
-      }
-    ]
-  }
-}
-
-// 3. DCR for Windows Sysmon Events - Critical to Sentinel, all to Verbose
-resource dcrSysmonEvents 'Microsoft.Insights/dataCollectionRules@2022-06-01' = {
-  name: '${prefix}-dcr-sysmon'
-  location: location
-  tags: tags
-  properties: {
-    dataCollectionEndpointId: null // Use default endpoint
-    description: 'Collects Sysmon events'
-    dataSources: {
-      windowsEventLogs: [
-        {
-          name: 'sysmonEvents'
-          streams: ['Microsoft-WindowsEvent']
-          xPathQueries: ['Microsoft-Windows-Sysmon/Operational!*']
-        }
-      ]
-    }
-    destinations: {
-      logAnalytics: [
-        {
-          workspaceResourceId: sentinelWorkspace.id
-          name: 'sentinelDestination'
-        },
-        {
-          workspaceResourceId: verboseWorkspace.id
-          name: 'verboseDestination'
-        }
-      ]
-    }
-    dataFlows: [
-      {
-        streams: ['Microsoft-WindowsEvent']
-        destinations: ['sentinelDestination']
-        transformKql: 'source | where EventID in (1, 3, 7, 11, 12, 13, 22)' // Process creation, network, image load, file creation, registry, etc.
-      },
-      {
-        streams: ['Microsoft-WindowsEvent']
-        destinations: ['verboseDestination']
-        // No transform - send all Sysmon events to verbose
-      }
-    ]
-  }
-}
-
-// 4. DCR for Linux Syslog - Critical to Sentinel, all to Verbose
-resource dcrLinuxSyslog 'Microsoft.Insights/dataCollectionRules@2022-06-01' = {
-  name: '${prefix}-dcr-linux-syslog'
-  location: location
-  tags: tags
-  properties: {
-    dataCollectionEndpointId: null // Use default endpoint
-    description: 'Collects Linux Syslog messages'
-    dataSources: {
-      syslog: [
-        {
-          name: 'sysLogDataSource'
-          streams: ['Microsoft-Syslog']
-          facilityNames: ['auth', 'authpriv', 'cron', 'daemon', 'security']
-          logLevels: ['Emergency', 'Alert', 'Critical', 'Error', 'Warning']
-        }
-      ]
-    }
-    destinations: {
-      logAnalytics: [
-        {
-          workspaceResourceId: sentinelWorkspace.id
-          name: 'sentinelDestination'
-        },
-        {
-          workspaceResourceId: verboseWorkspace.id
-          name: 'verboseDestination'
-        }
-      ]
-    }
-    dataFlows: [
-      {
-        streams: ['Microsoft-Syslog']
-        destinations: ['sentinelDestination']
-        transformKql: 'source | where SeverityLevel <= 3 or Facility in ("auth", "authpriv", "security")'
-      },
-      {
-        streams: ['Microsoft-Syslog']
-        destinations: ['verboseDestination']
-        // No transform - send all syslog to verbose
-      }
-    ]
-  }
-}
-
-// 5. DCR for Staging Workspace - Preprocessing data
-resource dcrProcessStaging 'Microsoft.Insights/dataCollectionRules@2022-06-01' = {
-  name: '${prefix}-dcr-process-staging'
-  location: location
-  tags: tags
-  properties: {
-    dataCollectionEndpointId: null // Use default endpoint
-    description: 'Collects data for staging/preprocessing workspace'
-    dataSources: {
-      windowsEventLogs: [
-        {
-          name: 'winVPNEvents'
-          streams: ['Microsoft-WindowsEvent']
-          xPathQueries: ['System!*[System[Provider[@Name="RasClient"]]]', 'System!*[System[Provider[@Name="RemoteAccess"]]]']
-        }
-      ]
-    }
-    destinations: {
-      logAnalytics: [
-        {
-          workspaceResourceId: stagingWorkspace.id
-          name: 'stagingDestination'
-        }
-      ]
-    }
-    dataFlows: [
-      {
-        streams: ['Microsoft-WindowsEvent']
-        destinations: ['stagingDestination']
-        // Optional transformation if needed
-      }
-    ]
-  }
-}
-
-// 6. Workspace-level DCR for Azure resource diagnostics filtering
-resource dcrTransformFirewallLogs 'Microsoft.Insights/dataCollectionRules@2022-06-01' = {
-  name: '${prefix}-dcr-transform-firewall-logs'
-  location: location
-  tags: tags
-  properties: {
-    description: 'Transforms Azure Firewall logs to filter out noise'
-    dataCollectionEndpointId: null
-    streamDeclarations: {
-      'Custom-AzureFirewallLogs': {
-        columns: [
-          {
-            name: 'TimeGenerated',
-            type: 'datetime'
-          },
-          {
-            name: 'Category',
-            type: 'string'
-          },
-          {
-            name: 'OperationName',
-            type: 'string'
-          },
-          {
-            name: 'ResourceId',
-            type: 'string'
-          },
-          {
-            name: 'properties_msg',
-            type: 'dynamic'
-          },
-          // Add other columns as needed
-        ]
-      }
-    }
-    destinations: {
-      logAnalytics: [
-        {
-          workspaceResourceId: sentinelWorkspace.id
-          name: 'sentinelDestination'
-        }
-      ]
-    }
-    dataFlows: [
-      {
-        streams: ['Custom-AzureFirewallLogs'],
-        destinations: ['sentinelDestination'],
-        transformKql: 'source | where Category == "AzureFirewallApplicationRule" or Category == "AzureFirewallNetworkRule" | where OperationName == "AzureFirewallApplicationRuleLog" or OperationName == "AzureFirewallNetworkRuleLog" | where properties_msg has_any ("Deny", "ThreatIntel", "IDS", "Alert")'
-      }
-    ]
-  }
-}
-
-// --------------------- DCR ASSOCIATIONS -----------------------
-
-// Associate DCRs with VMs - in a real environment you'd use a loop over vmResourceIds
-// This is a simplified example for one VM
-
-@batchSize(1) // Process associations one at a time
-resource dcrAssociationSecurityCritical 'Microsoft.Insights/dataCollectionRuleAssociations@2022-06-01' = [for (vmId, i) in vmResourceIds: {
-  name: '${prefix}-dcra-security-critical-${i}'
-  properties: {
-    dataCollectionRuleId: dcrSecurityEventsCritical.id
-    description: 'Association of critical security events DCR with VM'
-  }
-  scope: resourceId('Microsoft.Compute/virtualMachines', vmId)
-}]
-
-@batchSize(1)
-resource dcrAssociationSecurityAll 'Microsoft.Insights/dataCollectionRuleAssociations@2022-06-01' = [for (vmId, i) in vmResourceIds: {
-  name: '${prefix}-dcra-security-all-${i}'
-  properties: {
-    dataCollectionRuleId: dcrSecurityEventsAll.id
-    description: 'Association of all security events DCR with VM'
-  }
-  scope: resourceId('Microsoft.Compute/virtualMachines', vmId)
-}]
-
-@batchSize(1)
-resource dcrAssociationSysmon 'Microsoft.Insights/dataCollectionRuleAssociations@2022-06-01' = [for (vmId, i) in vmResourceIds: {
-  name: '${prefix}-dcra-sysmon-${i}'
-  properties: {
-    dataCollectionRuleId: dcrSysmonEvents.id
-    description: 'Association of Sysmon DCR with VM'
-  }
-  scope: resourceId('Microsoft.Compute/virtualMachines', vmId)
-}]
-
-// --------------------- SENTINEL CONTENT -----------------------
-
-// 1. Microsoft Defender XDR Data Connector
-resource defenderXdrConnector 'Microsoft.SecurityInsights/dataConnectors@2022-11-01' = {
-  name: wdxrConnectorName
-  scope: sentinelWorkspace
-  kind: 'MicrosoftThreatProtection'
-  properties: {
-    tenantId: subscription().tenantId
-    dataTypes: {
-      incidents: {
-        state: 'enabled'
-      }
-    }
+// Deploy Data Collection Rules
+module dataCollectionRules 'modules/data-collection-rules.bicep' = {
+  name: 'dcr-deployment'
+  params: {
+    location: location
+    prefix: prefix
+    tags: tags
+    sentinelWorkspaceId: workspaces.outputs.sentinelWorkspaceId
+    verboseWorkspaceId: workspaces.outputs.verboseWorkspaceId
+    stagingWorkspaceId: workspaces.outputs.stagingWorkspaceId
+    vmResourceIds: vmResourceIds
   }
   dependsOn: [
-    enableSentinel // Make sure Sentinel is enabled first
+    workspaces
   ]
 }
 
-// 2. Analytics Rule - Cross-Workspace Example (Impossible Travel)
-resource impossibleTravelRule 'Microsoft.SecurityInsights/alertRules@2023-05-01' = {
-  name: guid('${prefix}-rule-impossible-travel')
-  kind: 'Scheduled'
-  scope: sentinelWorkspace
-  properties: {
-    displayName: 'Impossible Travel Detection - Cross Workspace'
-    description: 'This rule detects when a user logs in from two geographically distant locations within a short time window'
-    severity: 'Medium'
-    enabled: false // Disabled by default
-    query: '''
-      // Get VPN logins from staging workspace 
-      let vpnLogs = workspace("${stagingWorkspaceName}").WindowsEvent
-      | where EventID == 20272 and EventData has "RasClient"
-      | extend UserName = extract("UserName: ([^,]+)", 1, tostring(EventData))
-      | where isnotempty(UserName)
-      | project TimeGenerated, UserName, Computer, VpnConnection = true;
-      
-      // Get Azure AD logins from Sentinel workspace
-      let aadLogins = SigninLogs
-      | where ResultType == 0
-      | project TimeGenerated, UserName = UserPrincipalName, Location, IPAddress, AADConnection = true;
-      
-      // Join and look for impossible travel
-      vpnLogs
-      | join kind=inner (aadLogins) on UserName
-      | where abs(datetime_diff('minute', TimeGenerated, TimeGenerated1)) < 60 // Within 60 minutes
-      | project
-          UserName,
-          VpnTime = TimeGenerated,
-          VpnComputer = Computer,
-          AadTime = TimeGenerated1,
-          AadLocation = Location,
-          AadIpAddress = IPAddress
-      | extend AlertDetails = strcat("User ", UserName, " logged in from VPN on ", VpnComputer, " at ", VpnTime, " and from Azure AD location ", AadLocation, " at ", AadTime)
-    '''
-    queryFrequency: 'PT1H'
-    queryPeriod: 'PT1H'
-    triggerOperator: 'GreaterThan'
-    triggerThreshold: 0
-    suppressionDuration: 'PT5H'
-    suppressionEnabled: false
-    tactics: [
-      'InitialAccess'
-      'LateralMovement'
-    ]
-    techniques: [
-      'T1078' // Valid Accounts
-    ]
-    entityMappings: [
-      {
-        entityType: 'Account'
-        fieldMappings: [
-          {
-            identifier: 'Name'
-            columnName: 'UserName'
-          }
-        ]
-      }
-    ]
-    alertDetailsOverride: {
-      alertDisplayNameFormat: 'Impossible Travel: {{UserName}}'
-      alertDescriptionFormat: 'User {{UserName}} has logged in from two distant locations in a short timeframe'
-    }
-    eventGroupingSettings: {
-      aggregationKind: 'SingleAlert'
-    }
-    incidentConfiguration: {
-      createIncident: true
-      groupingConfiguration: {
-        enabled: true
-        reopenClosedIncident: false
-        lookbackDuration: 'PT5H'
-        matchingMethod: 'AllEntities'
-        groupByEntities: [
-          'Account'
-        ]
-        groupByAlertDetails: []
-        groupByCustomDetails: []
-      }
-    }
+// Deploy Sentinel Analytics Rules and Connectors
+module analyticsRules 'modules/analytics-rules.bicep' = {
+  name: 'analytics-rules-deployment'
+  params: {
+    prefix: prefix
+    sentinelWorkspaceName: workspaces.outputs.sentinelWorkspaceName
+    stagingWorkspaceName: workspaces.outputs.stagingWorkspaceName
   }
   dependsOn: [
-    enableSentinel
-    stagingWorkspace
+    workspaces
   ]
 }
 
-// 3. Analytics Rule - Detect critical Windows events
-resource criticalWindowsEventsRule 'Microsoft.SecurityInsights/alertRules@2023-05-01' = {
-  name: guid('${prefix}-rule-critical-windows-events')
-  kind: 'Scheduled'
-  scope: sentinelWorkspace
-  properties: {
-    displayName: 'Critical Windows Security Events'
-    description: 'This rule detects critical Windows security events like account creation, privilege escalation, etc.'
-    severity: 'Medium'
-    enabled: false // Disabled by default
-    query: '''
-      SecurityEvent
-      | where EventID in (4720, 4728, 4732, 4756, 4625, 4740, 4624, 4672)
-      | where AccountType == "User" and not(Account has "\\$")
-      | extend EventDescription = case(
-          EventID == 4720, "User account created",
-          EventID == 4728, "User added to privileged group",
-          EventID == 4732, "User added to privileged group",
-          EventID == 4756, "User added to privileged group",
-          EventID == 4625, "Failed logon",
-          EventID == 4740, "User account locked out",
-          EventID == 4624 and AccountType == "User" and LogonType == 10, "Remote interactive logon",
-          EventID == 4672, "Admin privileges assigned",
-          "Other security event"
-        )
-      | project TimeGenerated, Computer, EventID, Account, AccountType, LogonType, Activity, EventDescription
-    '''
-    queryFrequency: 'PT1H'
-    queryPeriod: 'PT1H'
-    triggerOperator: 'GreaterThan'
-    triggerThreshold: 0
-    suppressionDuration: 'PT1H'
-    suppressionEnabled: false
-    tactics: [
-      'PrivilegeEscalation'
-      'InitialAccess'
-      'Persistence'
-    ]
-    techniques: [
-      'T1078' // Valid Accounts
-      'T1098' // Account Manipulation
-    ]
-    entityMappings: [
-      {
-        entityType: 'Account'
-        fieldMappings: [
-          {
-            identifier: 'Name'
-            columnName: 'Account'
-          }
-        ]
-      },
-      {
-        entityType: 'Host'
-        fieldMappings: [
-          {
-            identifier: 'HostName'
-            columnName: 'Computer'
-          }
-        ]
-      }
-    ]
-    alertDetailsOverride: {
-      alertDisplayNameFormat: '{{EventDescription}} - {{Account}}'
-      alertDescriptionFormat: '{{EventDescription}} was detected for account {{Account}} on host {{Computer}}'
-    }
-    eventGroupingSettings: {
-      aggregationKind: 'SingleAlert'
-    }
-    incidentConfiguration: {
-      createIncident: true
-      groupingConfiguration: {
-        enabled: true
-        reopenClosedIncident: false
-        lookbackDuration: 'PT5H'
-        matchingMethod: 'AllEntities'
-        groupByEntities: [
-          'Account'
-          'Host'
-        ]
-        groupByAlertDetails: []
-        groupByCustomDetails: []
-      }
-    }
+// Deploy Diagnostic Settings
+module diagnosticSettings 'modules/diagnostic-settings.bicep' = {
+  name: 'diagnostic-settings-deployment'
+  params: {
+    prefix: prefix
+    sentinelWorkspaceId: workspaces.outputs.sentinelWorkspaceId
+    verboseWorkspaceId: workspaces.outputs.verboseWorkspaceId
   }
   dependsOn: [
-    enableSentinel
+    workspaces
   ]
 }
 
-// --------------------- OPTIONAL: DIAGNOSTIC SETTINGS -----------------------
-
-// 1. Diagnostic settings for Azure Firewall - Send to both workspaces with filtering
-resource azureFirewallDiagnosticSettings 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = {
-  name: '${prefix}-fw-diag-settings'
-  scope: resourceGroup() // This would normally scope to your Azure Firewall resource
-  properties: {
-    workspaceId: sentinelWorkspace.id
-    logs: [
-      {
-        category: 'AzureFirewallApplicationRule'
-        enabled: true
-      },
-      {
-        category: 'AzureFirewallNetworkRule'
-        enabled: true
-      },
-      {
-        category: 'AzureFirewallDnsProxy'
-        enabled: true
-      }
-    ]
-    metrics: [
-      {
-        category: 'AllMetrics'
-        enabled: true
-      }
-    ]
-  }
-}
-
-// 2. Diagnostic settings for sending all logs to verbose workspace
-resource azureFirewallVerboseDiagnosticSettings 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = {
-  name: '${prefix}-fw-verbose-diag-settings'
-  scope: resourceGroup() // This would normally scope to your Azure Firewall resource
-  properties: {
-    workspaceId: verboseWorkspace.id
-    logs: [
-      {
-        category: 'AzureFirewallApplicationRule'
-        enabled: true
-      },
-      {
-        category: 'AzureFirewallNetworkRule'
-        enabled: true
-      },
-      {
-        category: 'AzureFirewallDnsProxy'
-        enabled: true
-      },
-      {
-        category: 'AzureFirewallThreatIntel'
-        enabled: true
-      }
-    ]
-    metrics: [
-      {
-        category: 'AllMetrics'
-        enabled: true
-      }
-    ]
-  }
-}
-
-// --------------------- DATA EXPORT FOR REGULATORY COMPLIANCE -----------------------
-
-// Data Export for long-term storage in Azure Data Lake (for GDPR/CCPA/SOX compliance)
-resource sentinelDataExport 'Microsoft.OperationalInsights/workspaces/dataExports@2020-08-01' = {
-  name: '${sentinelWorkspaceName}/compliance-data-export'
-  properties: {
-    destination: {
-      resourceId: storageAccount.id
-    }
-    tableName: 'SecurityEvent'
-    enabled: true
+// Deploy Compliance Resources
+module compliance 'modules/compliance.bicep' = {
+  name: 'compliance-deployment'
+  params: {
+    location: location
+    prefix: prefix
+    tags: tags
+    sentinelWorkspaceName: workspaces.outputs.sentinelWorkspaceName
   }
   dependsOn: [
-    sentinelWorkspace
+    workspaces
   ]
 }
 
-// Storage account for data export (archival)
-resource storageAccount 'Microsoft.Storage/storageAccounts@2021-08-01' = {
-  name: '${prefix}compliancesa'
-  location: location
-  tags: tags
-  kind: 'StorageV2'
-  sku: {
-    name: 'Standard_GRS' // Geo-redundant storage for regulatory compliance
-  }
-  properties: {
-    accessTier: 'Cool'
-    supportsHttpsTrafficOnly: true
-    minimumTlsVersion: 'TLS1_2'
-    allowBlobPublicAccess: false
-    allowSharedKeyAccess: true
-    networkAcls: {
-      bypass: 'AzureServices'
-      defaultAction: 'Deny'
-      virtualNetworkRules: []
-      ipRules: []
-    }
-    encryption: {
-      services: {
-        blob: {
-          enabled: true
-        }
-        file: {
-          enabled: true
-        }
-      }
-      keySource: 'Microsoft.Storage'
-    }
-  }
-}
-
-// Add GDPR/CCPA compliance lock to prevent accidental deletion
-resource deleteLock 'Microsoft.Authorization/locks@2020-05-01' = {
-  name: '${prefix}-compliance-delete-lock'
-  properties: {
-    level: 'CanNotDelete'
-    notes: 'This lock prevents deletion of resources required for regulatory compliance (SOX, GDPR, CCPA)'
-  }
-  scope: storageAccount
-}
-
-// --------------------- OUTPUTS -----------------------
-
-output sentinelWorkspaceId string = sentinelWorkspace.id
-output verboseWorkspaceId string = verboseWorkspace.id
-output stagingWorkspaceId string = stagingWorkspace.id
-output sentinelWorkspaceName string = sentinelWorkspace.name
-output verboseWorkspaceName string = verboseWorkspace.name
-output stagingWorkspaceName string = stagingWorkspace.name
-output laClusterId string = useLogAnalyticsCluster ? laCluster.id : 'Not deployed'
-output storageAccountId string = storageAccount.id
+// Outputs
+output sentinelWorkspaceId string = workspaces.outputs.sentinelWorkspaceId
+output verboseWorkspaceId string = workspaces.outputs.verboseWorkspaceId
+output stagingWorkspaceId string = workspaces.outputs.stagingWorkspaceId
+output sentinelWorkspaceName string = workspaces.outputs.sentinelWorkspaceName
+output verboseWorkspaceName string = workspaces.outputs.verboseWorkspaceName
+output stagingWorkspaceName string = workspaces.outputs.stagingWorkspaceName
+output laClusterId string = workspaces.outputs.laClusterId
+output storageAccountId string = compliance.outputs.storageAccountId
