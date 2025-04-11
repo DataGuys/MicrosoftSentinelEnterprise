@@ -1,0 +1,419 @@
+# Advanced KQL Queries for Multi-Workspace Azure Sentinel
+
+This document provides a collection of Kusto Query Language (KQL) queries specifically designed for a multi-workspace Azure Sentinel architecture. These queries demonstrate how to effectively work with data across the central Sentinel workspace, verbose workspace, and staging workspace.
+
+## Table of Contents
+
+- [Cross-Workspace Queries](#cross-workspace-queries)
+- [Data Comparison Queries](#data-comparison-queries)
+- [Security Analytics Queries](#security-analytics-queries)
+- [Operational Analytics Queries](#operational-analytics-queries)
+- [Cost Optimization Queries](#cost-optimization-queries)
+- [Compliance and Audit Queries](#compliance-and-audit-queries)
+
+## Cross-Workspace Queries
+
+### Basic Cross-Workspace Query Template
+
+```kusto
+// Access data from another workspace
+let verboseData = workspace("<verbose-workspace-name>").SecurityEvent
+| where TimeGenerated > ago(1h);
+
+// Use the data in your query
+verboseData
+| summarize count() by EventID
+```
+
+### Join Data from Multiple Workspaces
+
+```kusto
+// Get data from Sentinel workspace
+let sentinelSecurityEvents = SecurityEvent
+| where TimeGenerated > ago(1h)
+| where EventID in (4624, 4625);
+
+// Get data from verbose workspace
+let verboseSecurityEvents = workspace("<verbose-workspace-name>").SecurityEvent
+| where TimeGenerated > ago(1h)
+| where EventID in (4688, 4689);
+
+// Join the datasets
+sentinelSecurityEvents
+| summarize SentinelLoginCount=count() by Computer
+| join kind=fullouter (
+    verboseSecurityEvents
+    | summarize VerboseProcessCount=count() by Computer
+) on Computer
+| project Computer, SentinelLoginCount, VerboseProcessCount
+```
+
+### Query Data from All Three Workspaces
+
+```kusto
+// Define our workspace variables
+let sentinelWS = "<sentinel-workspace-name>";
+let verboseWS = "<verbose-workspace-name>";
+let stagingWS = "<staging-workspace-name>";
+
+// Query security events from each workspace
+let sentinelEvents = SecurityEvent
+| where TimeGenerated > ago(24h);
+
+let verboseEvents = workspace(verboseWS).SecurityEvent
+| where TimeGenerated > ago(24h);
+
+let stagingEvents = workspace(stagingWS).WindowsEvent
+| where TimeGenerated > ago(24h) 
+| where EventID in (4624, 4625, 4672);
+
+// Analyze data from all three sources
+sentinelEvents | summarize SentinelCount=count() by EventID
+| join kind=fullouter (
+    verboseEvents | summarize VerboseCount=count() by EventID
+) on EventID
+| join kind=fullouter (
+    stagingEvents | summarize StagingCount=count() by EventID
+) on EventID
+| project EventID, SentinelCount, VerboseCount, StagingCount
+```
+
+## Data Comparison Queries
+
+### Compare Data Volumes Between Workspaces
+
+```kusto
+// Compare data volumes across workspaces
+let sentinelData = Usage
+| where TimeGenerated > ago(7d)
+| summarize SentinelGB=sum(Quantity)/1000 by DataType;
+
+let verboseData = workspace("<verbose-workspace-name>").Usage
+| where TimeGenerated > ago(7d)
+| summarize VerboseGB=sum(Quantity)/1000 by DataType;
+
+sentinelData
+| join kind=fullouter (verboseData) on DataType
+| project DataType, SentinelGB, VerboseGB
+| extend DataRatio = iff(VerboseGB > 0, SentinelGB / VerboseGB, 0)
+| sort by DataRatio asc
+```
+
+### Validate DCR Filtering Effectiveness
+
+```kusto
+// Check if DCR filtering is working correctly
+let sentinelEvents = SecurityEvent
+| where TimeGenerated > ago(1d)
+| where EventID in (4624, 4625, 4672, 4720, 4726, 4740);
+
+let verboseEvents = workspace("<verbose-workspace-name>").SecurityEvent
+| where TimeGenerated > ago(1d)
+| where EventID in (4624, 4625, 4672, 4720, 4726, 4740);
+
+// Compare counts - verbose should have more
+sentinelEvents 
+| summarize SentinelCount=count() by EventID
+| join (
+    verboseEvents 
+    | summarize VerboseCount=count() by EventID
+) on EventID
+| extend FilterRatio = 1.0 * SentinelCount / VerboseCount
+| project EventID, SentinelCount, VerboseCount, 
+    FilterRatio,
+    FilterEffectiveness = iff(FilterRatio < 1.0, "Filtering Active", "No Filtering")
+```
+
+## Security Analytics Queries
+
+### Impossible Travel Detection (Cross-Workspace)
+
+```kusto
+// Get VPN logins from staging workspace 
+let vpnLogs = workspace("<staging-workspace-name>").WindowsEvent
+| where EventID == 20272 and EventData has "RasClient"
+| extend UserName = extract("UserName: ([^,]+)", 1, tostring(EventData))
+| where isnotempty(UserName)
+| project TimeGenerated, UserName, Computer, VpnConnection = true;
+
+// Get Azure AD logins from Sentinel workspace
+let aadLogins = SigninLogs
+| where ResultType == 0
+| project TimeGenerated, UserName = UserPrincipalName, Location, IPAddress, AADConnection = true;
+
+// Join and look for impossible travel
+vpnLogs
+| join kind=inner (aadLogins) on UserName
+| where abs(datetime_diff('minute', TimeGenerated, TimeGenerated1)) < 60 // Within 60 minutes
+| project
+    UserName,
+    VpnTime = TimeGenerated,
+    VpnComputer = Computer,
+    AadTime = TimeGenerated1,
+    AadLocation = Location,
+    AadIpAddress = IPAddress
+| extend AlertDetails = strcat("User ", UserName, " logged in from VPN on ", VpnComputer, " at ", VpnTime, " and from Azure AD location ", AadLocation, " at ", AadTime)
+```
+
+### Enriched Security Event Analysis
+
+```kusto
+// Get critical security events from Sentinel workspace
+let criticalEvents = SecurityEvent
+| where TimeGenerated > ago(1d)
+| where EventID in (4624, 4625);
+
+// Get process execution details from verbose workspace for context
+let processContext = workspace("<verbose-workspace-name>").SecurityEvent
+| where TimeGenerated > ago(1d)
+| where EventID == 4688
+| project TimeGenerated, Computer, Account, Process, CommandLine, ParentProcessName;
+
+// Enrich login events with process context
+criticalEvents
+| where EventID == 4624 // Successful login
+| project TimeGenerated, Computer, Account, LogonType, IpAddress
+| join kind=leftouter (
+    processContext
+) on Computer, Account
+| where TimeGenerated1 between (TimeGenerated .. (TimeGenerated + 5min))
+| project 
+    TimeGenerated, 
+    Computer, 
+    Account, 
+    LogonType, 
+    IpAddress, 
+    ProcessExecuted = Process,
+    CommandLine,
+    ParentProcess = ParentProcessName
+```
+
+### Identify Privileged Account Activity Across Tiers
+
+```kusto
+// Get privileged accounts from Sentinel workspace
+let privilegedAccounts = SecurityEvent
+| where TimeGenerated > ago(7d)
+| where EventID == 4672 // Admin login
+| distinct Account;
+
+// Track these accounts across all workspaces
+let sentinelActivity = SecurityEvent
+| where TimeGenerated > ago(1d)
+| where Account in (privilegedAccounts)
+| project TimeGenerated, Computer, Account, Activity = "In Sentinel";
+
+let verboseActivity = workspace("<verbose-workspace-name>").SecurityEvent
+| where TimeGenerated > ago(1d)
+| where Account in (privilegedAccounts)
+| project TimeGenerated, Computer, Account, Activity = "In Verbose";
+
+let stagingActivity = workspace("<staging-workspace-name>").WindowsEvent
+| where TimeGenerated > ago(1d)
+| where EventData has_any (privilegedAccounts)
+| extend Account = extract("Account Name:\\s+([^\\s]+)", 1, tostring(EventData))
+| where Account in (privilegedAccounts)
+| project TimeGenerated, Computer, Account, Activity = "In Staging";
+
+// Combine all activities
+union sentinelActivity, verboseActivity, stagingActivity
+| summarize count() by Account, Computer, Activity
+| order by Account asc, Computer asc
+```
+
+## Operational Analytics Queries
+
+### Log Ingestion Health Check
+
+```kusto
+// Check data freshness across workspaces
+let sentinelFreshness = _LogOperation 
+| where Operation == "Data collection" 
+| summarize LastIngestion = max(TimeGenerated) by Computer;
+
+let verboseFreshness = workspace("<verbose-workspace-name>")._LogOperation 
+| where Operation == "Data collection" 
+| summarize LastIngestion = max(TimeGenerated) by Computer;
+
+let stagingFreshness = workspace("<staging-workspace-name>")._LogOperation 
+| where Operation == "Data collection" 
+| summarize LastIngestion = max(TimeGenerated) by Computer;
+
+// Combine and check freshness
+union
+(sentinelFreshness | extend Workspace = "Sentinel"),
+(verboseFreshness | extend Workspace = "Verbose"),
+(stagingFreshness | extend Workspace = "Staging")
+| summarize arg_max(LastIngestion, Workspace) by Computer
+| extend TimeSinceLastIngestion = now() - LastIngestion
+| extend IngestionStatus = iff(TimeSinceLastIngestion > timespan(1h), "Stale", "Current")
+| project Computer, Workspace, LastIngestion, TimeSinceLastIngestion, IngestionStatus
+| sort by IngestionStatus asc, TimeSinceLastIngestion desc
+```
+
+### DCR Transformation Validation
+
+```kusto
+// Verify DCR transformations are working as expected
+// First, check if critical event IDs are in the Sentinel workspace
+let sentinelEventIDs = SecurityEvent
+| where TimeGenerated > ago(6h)
+| summarize SentinelEventCount = count() by EventID;
+
+// Then compare with verbose workspace (should have more)
+let verboseEventIDs = workspace("<verbose-workspace-name>").SecurityEvent
+| where TimeGenerated > ago(6h)
+| summarize VerboseEventCount = count() by EventID;
+
+// Join to see differences
+verboseEventIDs
+| join kind=fullouter (sentinelEventIDs) on EventID
+| extend 
+    SentinelEventCount = iif(isempty(SentinelEventCount), 0, SentinelEventCount),
+    TransformStatus = case(
+        SentinelEventCount == 0 and VerboseEventCount > 0, "Filtered Out",
+        SentinelEventCount < VerboseEventCount, "Partially Filtered",
+        SentinelEventCount == VerboseEventCount, "Not Filtered",
+        "Unknown"
+    )
+| project 
+    EventID, 
+    VerboseEventCount, 
+    SentinelEventCount,
+    FilterRatio = iff(VerboseEventCount > 0, 1.0 * SentinelEventCount / VerboseEventCount, 0),
+    TransformStatus
+| sort by FilterRatio asc
+```
+
+## Cost Optimization Queries
+
+### Identify High-Volume Tables
+
+```kusto
+// Check ingestion volume by table across workspaces
+let sentinelUsage = Usage
+| where TimeGenerated > ago(30d)
+| summarize SentinelGB = sum(Quantity)/1000 by DataType;
+
+let verboseUsage = workspace("<verbose-workspace-name>").Usage
+| where TimeGenerated > ago(30d)
+| summarize VerboseGB = sum(Quantity)/1000 by DataType;
+
+// Combine and analyze
+sentinelUsage
+| join kind=fullouter (verboseUsage) on DataType
+| project 
+    DataType, 
+    SentinelGB = iif(isempty(SentinelGB), 0, SentinelGB), 
+    VerboseGB = iif(isempty(VerboseGB), 0, VerboseGB),
+    TotalGB = iif(isempty(SentinelGB), 0, SentinelGB) + iif(isempty(VerboseGB), 0, VerboseGB)
+| extend 
+    SentinelPercentage = iff(TotalGB > 0, 100.0 * SentinelGB / TotalGB, 0),
+    RecommendedAction = case(
+        SentinelGB > 5 and SentinelPercentage > 80, "Consider moving to verbose workspace",
+        SentinelGB > 20, "High volume - review filtering",
+        SentinelGB < 0.1 and VerboseGB > 5, "Effective tiering",
+        "No action needed"
+    )
+| sort by TotalGB desc
+```
+
+### Estimate Cost Savings from Tiered Architecture
+
+```kusto
+// Calculate estimated cost savings
+let analyticsPrice = 2.76; // $ per GB for Analytics tier
+let basicPrice = 0.74; // $ per GB for Basic/Auxiliary tier
+
+let sentinelUsage = Usage
+| where TimeGenerated > ago(30d)
+| summarize SentinelGB = sum(Quantity)/1000;
+
+let verboseUsage = workspace("<verbose-workspace-name>").Usage
+| where TimeGenerated > ago(30d)
+| summarize VerboseGB = sum(Quantity)/1000;
+
+// Calculate hypothetical costs
+let actualCost = SentinelGB * analyticsPrice + VerboseGB * basicPrice;
+let singleWorkspaceCost = (SentinelGB + VerboseGB) * analyticsPrice;
+
+// Calculate savings
+extend 
+    ActualCost = strcat(SentinelGB * analyticsPrice + VerboseGB * basicPrice, " $"),
+    HypotheticalSingleWorkspaceCost = strcat((SentinelGB + VerboseGB) * analyticsPrice, " $"),
+    MonthlySavings = strcat((SentinelGB + VerboseGB) * analyticsPrice - (SentinelGB * analyticsPrice + VerboseGB * basicPrice), " $"),
+    SavingsPercentage = strcat(100 * (1 - (SentinelGB * analyticsPrice + VerboseGB * basicPrice) / ((SentinelGB + VerboseGB) * analyticsPrice)), " %")
+```
+
+## Compliance and Audit Queries
+
+### Audit Privileged Operations Across Workspaces
+
+```kusto
+// First check privileged operations in Sentinel workspace
+let sentinelPrivOps = SecurityEvent
+| where TimeGenerated > ago(7d)
+| where EventID in (4732, 4728, 4756) // Group modifications
+| project TimeGenerated, Computer, Account, Activity, TargetAccount, EventID;
+
+// Then check in verbose workspace
+let verbosePrivOps = workspace("<verbose-workspace-name>").SecurityEvent
+| where TimeGenerated > ago(7d)
+| where EventID in (4732, 4728, 4756) // Group modifications
+| project TimeGenerated, Computer, Account, Activity, TargetAccount, EventID;
+
+// Compare and validate
+let sentinelCount = sentinelPrivOps | count;
+let verboseCount = verbosePrivOps | count;
+
+// Show privileged operations and verification
+verbosePrivOps
+| summarize OperationCount=count() by Computer, Account, Activity
+| extend Source = "Verbose Workspace"
+| union (
+    sentinelPrivOps 
+    | summarize OperationCount=count() by Computer, Account, Activity
+    | extend Source = "Sentinel Workspace"
+)
+| order by Computer asc, Account asc, Activity asc, Source asc
+```
+
+### Long-Term Compliance Data Access
+
+```kusto
+// Query verbose workspace for historical compliance data
+workspace("<verbose-workspace-name>").SecurityEvent
+| where TimeGenerated > ago(180d) and TimeGenerated < ago(170d)
+| where EventID in (
+    4624, // Login
+    4625, // Failed login
+    4648, // Explicit credential logon
+    4672, // Admin logon
+    4720, // Account created
+    4722, // Account enabled
+    4724, // Password reset
+    4738  // Account changed
+)
+| summarize count() by EventID, bin(TimeGenerated, 1d)
+| render timechart
+```
+
+---
+
+## Usage Notes
+
+1. **Replace workspace names:**
+   - Replace `<sentinel-workspace-name>`, `<verbose-workspace-name>`, and `<staging-workspace-name>` with your actual workspace names.
+
+2. **Time ranges:**
+   - Adjust time ranges (`ago(1h)`, `ago(1d)`, etc.) based on your data retention settings and query requirements.
+
+3. **Performance considerations:**
+   - Cross-workspace queries can be more resource-intensive
+   - Use time filtering aggressively to improve performance
+   - Consider materializing frequently used cross-workspace data with scheduled analytics rules
+
+4. **Permissions:**
+   - Users running these queries need appropriate permissions on all referenced workspaces
+
+These KQL queries demonstrate how to effectively use a multi-workspace architecture to balance performance, cost, and functionality in Azure Sentinel.
